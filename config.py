@@ -7,11 +7,13 @@ class Config:
     num_nodes: int = 50
 
     # Data generation
-    num_train_instances: int = 2000
-    num_val_instances: int = 200
-    num_test_instances: int = 200
-    num_good_solutions: int = 2      # NN+2opt per instance
-    num_random_solutions: int = 4    # random permutations per instance
+    # Per-instance pool size mimics POMO rollout count (≈100 per instance).
+    # Instance count reduced proportionally to keep total tour count tractable.
+    num_train_instances: int = 200
+    num_val_instances: int = 50
+    num_test_instances: int = 50
+    num_good_solutions: int = 50     # NN+2opt per instance (anchor pool)
+    num_random_solutions: int = 50   # random permutations per instance
 
     # GNN encoder
     node_feat_dim: int = 2           # (x, y)

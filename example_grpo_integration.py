@@ -1,47 +1,40 @@
 """
-Example: how to use SVDReward as the reward signal in a GRPO training loop.
+Example: per-instance SVD reward in a GRPO training loop.
 
-This is a standalone sketch — adapt to your actual POMO + GRPO codebase.
+Each instance has G POMO rollouts.  We pick the top-k shortest as anchors,
+fit a per-instance SVD on the fly, and score every rollout by its residual
+to that instance's local subspace.  No global SVD, no offline anchor file.
+
+Adapt to your actual POMO + GRPO codebase.
 """
 
 import torch
-from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch
 
 from config import Config
 from model import TourAutoEncoder
-from svd_reward import SVDReward
-from tsp_data import make_pyg_data
+from svd_reward import per_instance_reward_torch, topk_anchor_idx
+from tsp_data import make_pyg_data, tour_length
 
 
-# ── 1. Load pretrained autoencoder + SVD subspace ────────────────────
-def load_reward_pipeline(ckpt_path: str, svd_path: str, device: torch.device):
+# ── 1. Load pretrained autoencoder ───────────────────────────────────
+def load_encoder(ckpt_path: str, device: torch.device) -> TourAutoEncoder:
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg = Config(**ckpt["config"])
     ae = TourAutoEncoder(cfg).to(device)
     ae.load_state_dict(ckpt["model"])
     ae.eval()
-
-    svd = SVDReward.load(svd_path)
-    return ae, svd
+    return ae
 
 
-# ── 2. Compute reward for a batch of POMO rollouts ──────────────────
+# ── 2. Encode all (instance, rollout) tours into a (B, G, D) tensor ──
 @torch.no_grad()
-def compute_svd_reward(
+def encode_rollouts(
     ae: TourAutoEncoder,
-    svd: SVDReward,
-    coords_batch,       # (B, N, 2)  problem instances
-    tours_batch,        # (B, G, N)  G rollouts per instance  (node indices)
+    coords_batch: torch.Tensor,    # (B, N, 2)
+    tours_batch: torch.Tensor,     # (B, G, N)  node indices
     device: torch.device,
-    temperature: float = 1.0,
-):
-    """
-    Args:
-        coords_batch:  (B, N, 2)  coordinates
-        tours_batch:   (B, G, N)  G completions per instance
-    Returns:
-        rewards:  (B, G)  normalized reward for each completion
-    """
+) -> torch.Tensor:
     B, G, N = tours_batch.shape
     coords_np = coords_batch.cpu().numpy()
     tours_np = tours_batch.cpu().numpy()
@@ -49,37 +42,61 @@ def compute_svd_reward(
     pyg_list = []
     for b in range(B):
         for g in range(G):
-            pyg_list.append(make_pyg_data(coords_np[b], tours_np[b, g]))
+            # instance_id is set so the encoder's internal logic can stay generic;
+            # per-instance grouping at reward time is done via the (B, G) reshape.
+            pyg_list.append(make_pyg_data(coords_np[b], tours_np[b, g], instance_id=b))
 
-    loader = DataLoader(pyg_list, batch_size=256)
-    embeddings = []
-    for batch in loader:
-        batch = batch.to(device)
-        z = ae.encode(batch)
-        embeddings.append(z.cpu())
-    embeddings = torch.cat(embeddings, dim=0)   # (B*G, D)
-
-    raw_reward = svd.reward(embeddings)         # (B*G,)  numpy
-    raw_reward = torch.tensor(raw_reward, dtype=torch.float32).view(B, G)
-
-    # Per-instance normalization (GRPO advantage style)
-    mean = raw_reward.mean(dim=1, keepdim=True)
-    std = raw_reward.std(dim=1, keepdim=True).clamp(min=1e-8)
-    return (raw_reward - mean) / std * temperature
+    big_batch = Batch.from_data_list(pyg_list).to(device)
+    z = ae.encode(big_batch)                       # (B*G, D)
+    return z.view(B, G, -1)                        # (B, G, D)
 
 
-# ── 3. Sketch: GRPO policy gradient step ─────────────────────────────
-def grpo_step_sketch(policy, optimizer, coords, tours, log_probs, ae, svd, device):
+# ── 3. Per-instance SVD reward (top-k by length as anchors) ──────────
+@torch.no_grad()
+def compute_svd_reward(
+    ae: TourAutoEncoder,
+    coords_batch: torch.Tensor,    # (B, N, 2)
+    tours_batch: torch.Tensor,     # (B, G, N)
+    device: torch.device,
+    rank: int = 16,
+    top_k: int = 50,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Returns:
+        advantage:  (B, G)  per-instance z-scored reward, ready for GRPO.
+    """
+    B, G, N = tours_batch.shape
+
+    # Lengths needed for choosing anchors.
+    coords_np = coords_batch.cpu().numpy()
+    tours_np = tours_batch.cpu().numpy()
+    lengths = torch.tensor(
+        [[tour_length(coords_np[b], tours_np[b, g]) for g in range(G)]
+         for b in range(B)],
+        dtype=torch.float32, device=device,
+    )                                               # (B, G)
+
+    # Encode → per-instance SVD on top-k by length → residual reward.
+    z = encode_rollouts(ae, coords_batch, tours_batch, device)   # (B, G, D)
+    anchor_idx = topk_anchor_idx(lengths, top_k=min(top_k, G // 2))
+    raw = per_instance_reward_torch(z, anchor_idx, rank=rank)    # (B, G)
+
+    # GRPO advantage style: per-instance z-score.
+    mean = raw.mean(dim=1, keepdim=True)
+    std = raw.std(dim=1, keepdim=True).clamp(min=1e-8)
+    return (raw - mean) / std * temperature
+
+
+# ── 4. Sketch: GRPO policy gradient step ─────────────────────────────
+def grpo_step_sketch(policy, optimizer, coords, tours, log_probs, ae, device):
     """
     coords:    (B, N, 2)
     tours:     (B, G, N)      sampled rollouts
     log_probs: (B, G)         log π(tour | instance)
     """
-    # --- SVD-based advantage ---
-    advantage = compute_svd_reward(ae, svd, coords, tours, device)  # (B, G)
-
-    # --- Policy gradient ---
-    loss = -(log_probs * advantage.to(device)).mean()
+    advantage = compute_svd_reward(ae, coords, tours, device)    # (B, G)
+    loss = -(log_probs * advantage).mean()
 
     optimizer.zero_grad()
     loss.backward()
@@ -87,35 +104,30 @@ def grpo_step_sketch(policy, optimizer, coords, tours, log_probs, ae, svd, devic
     return loss.item()
 
 
-# ── 4. Optional: hybrid reward (SVD structure + tour length) ─────────
-def hybrid_reward(ae, svd, coords_batch, tours_batch, device,
-                  alpha: float = 0.5):
+# ── 5. Optional: hybrid reward (SVD structure + tour length) ─────────
+def hybrid_reward(ae, coords_batch, tours_batch, device,
+                  alpha: float = 0.5, rank: int = 16, top_k: int = 50):
     """
-    reward = α · SVD_reward + (1−α) · cost_reward
-
-    α controls the trade-off:
-      α=1  →  pure structure reward
-      α=0  →  pure tour-length reward
+    advantage = α · SVD_advantage + (1−α) · cost_advantage   (both z-scored per instance)
     """
     B, G, N = tours_batch.shape
     coords_np = coords_batch.cpu().numpy()
     tours_np = tours_batch.cpu().numpy()
 
-    from tsp_data import tour_length
-    import numpy as np
+    lengths = torch.tensor(
+        [[tour_length(coords_np[b], tours_np[b, g]) for g in range(G)]
+         for b in range(B)],
+        dtype=torch.float32, device=device,
+    )
+    cost_reward = -lengths                                       # (B, G)
 
-    lengths = np.array([
-        [tour_length(coords_np[b], tours_np[b, g]) for g in range(G)]
-        for b in range(B)
-    ])
-    cost_reward = torch.tensor(-lengths, dtype=torch.float32)  # (B, G)
+    svd_adv = compute_svd_reward(
+        ae, coords_batch, tours_batch, device, rank=rank, top_k=top_k,
+    )
 
-    svd_reward = compute_svd_reward(ae, svd, coords_batch, tours_batch, device)
-
-    # Normalize both to z-scores per instance, then combine
     def znorm(r):
         m = r.mean(dim=1, keepdim=True)
         s = r.std(dim=1, keepdim=True).clamp(min=1e-8)
         return (r - m) / s
 
-    return alpha * znorm(svd_reward) + (1 - alpha) * znorm(cost_reward)
+    return alpha * svd_adv + (1 - alpha) * znorm(cost_reward)

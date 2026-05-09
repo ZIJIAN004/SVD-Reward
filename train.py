@@ -59,13 +59,13 @@ def train(cfg: Config = None):
     print(f"Device: {device}")
 
     print("Generating training data …")
-    train_data, _, train_good = generate_dataset(
+    train_data, _, train_good, train_iids = generate_dataset(
         cfg.num_train_instances, cfg.num_nodes,
         cfg.num_good_solutions, cfg.num_random_solutions,
         seed=cfg.seed,
     )
     print("Generating validation data …")
-    val_data, _, _ = generate_dataset(
+    val_data, _, _, _ = generate_dataset(
         cfg.num_val_instances, cfg.num_nodes,
         cfg.num_good_solutions, cfg.num_random_solutions,
         seed=cfg.seed + 1,
@@ -109,7 +109,7 @@ def train(cfg: Config = None):
                 break
 
     print(f"Best val_loss = {best_val:.4f}")
-    return model, train_data, train_good
+    return model, train_data, train_good, train_iids
 
 
 if __name__ == "__main__":

@@ -83,49 +83,56 @@ def compute_edge_labels(tour: np.ndarray, n: int) -> torch.Tensor:
     return torch.tensor(labels, dtype=torch.float32)
 
 
-def make_pyg_data(coords: np.ndarray, tour: np.ndarray) -> Data:
+def make_pyg_data(coords: np.ndarray, tour: np.ndarray, instance_id: int = -1) -> Data:
     n = len(tour)
     return Data(
         x=torch.tensor(coords, dtype=torch.float32),
         edge_index=tour_to_edge_index(tour),
         target=compute_edge_labels(tour, n),
         tour_len=torch.tensor([tour_length(coords, tour)], dtype=torch.float32),
+        instance_id=torch.tensor([instance_id], dtype=torch.long),
     )
 
 
 def generate_dataset(
     num_instances: int,
     num_nodes: int,
-    num_good: int = 2,
-    num_random: int = 4,
+    num_good: int = 50,
+    num_random: int = 50,
     seed: int = 42,
 ):
     """
     Returns:
-        data_list:  list[Data]
-        lengths:    list[float]
-        is_good:    list[bool]   True for NN+2opt solutions, False for random
+        data_list:    list[Data]   each carries .instance_id (long tensor)
+        lengths:      list[float]
+        is_good:      list[bool]   True for NN+2opt solutions, False for random
+        instance_ids: list[int]    which instance each tour belongs to
     """
     rng = np.random.default_rng(seed)
-    data_list, lengths, is_good = [], [], []
+    data_list, lengths, is_good, instance_ids = [], [], [], []
 
-    for _ in range(num_instances):
+    for inst in range(num_instances):
         coords = generate_instance(num_nodes, rng)
 
-        starts = rng.choice(num_nodes, size=num_good, replace=False)
+        # When num_good > num_nodes, allow repeated start points (different
+        # tie-breaks during 2opt may still produce diverse local optima).
+        replace = num_good > num_nodes
+        starts = rng.choice(num_nodes, size=num_good, replace=replace)
         for s in starts:
             tour = nearest_neighbor(coords, start=int(s))
             tour = two_opt(coords, tour)
-            d = make_pyg_data(coords, tour)
+            d = make_pyg_data(coords, tour, instance_id=inst)
             data_list.append(d)
             lengths.append(d.tour_len.item())
             is_good.append(True)
+            instance_ids.append(inst)
 
         for _ in range(num_random):
             tour = random_tour(num_nodes, rng)
-            d = make_pyg_data(coords, tour)
+            d = make_pyg_data(coords, tour, instance_id=inst)
             data_list.append(d)
             lengths.append(d.tour_len.item())
             is_good.append(False)
+            instance_ids.append(inst)
 
-    return data_list, lengths, is_good
+    return data_list, lengths, is_good, instance_ids
