@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     # TSP
-    num_nodes: int = 50
+    num_nodes: int = 100
 
     # Data generation
     # Per-instance pool size mimics POMO rollout count (≈100 per instance).
@@ -31,7 +31,7 @@ class Config:
     batch_size: int = 64
     lr: float = 1e-3
     weight_decay: float = 1e-5
-    num_epochs: int = 50
+    num_epochs: int = 4
     patience: int = 10
 
     # SVD subspace
