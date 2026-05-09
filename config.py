@@ -31,7 +31,7 @@ class Config:
     batch_size: int = 64
     lr: float = 1e-3
     weight_decay: float = 1e-5
-    num_epochs: int = 4
+    num_epochs: int = 50
     patience: int = 10
 
     # SVD subspace
