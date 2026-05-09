@@ -19,7 +19,9 @@ class Config:
     node_feat_dim: int = 2           # (x, y)
     hidden_dim: int = 128
     embedding_dim: int = 64
-    num_gnn_layers: int = 4
+    num_gnn_layers: int = 4          # tour-stream depth
+    num_instance_gnn_layers: int = 3 # instance-stream depth
+    knn_k: int = 10                  # instance-graph KNN connectivity
     dropout: float = 0.1
 
     # Edge decoder

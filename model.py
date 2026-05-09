@@ -21,14 +21,12 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class TourEncoder(nn.Module):
-    """GIN encoder: tour graph → graph-level embedding z."""
+class GINStack(nn.Module):
+    """Stack of GIN layers + BN + ReLU + Dropout, returning per-node features."""
 
-    def __init__(self, node_feat_dim: int, hidden_dim: int, embedding_dim: int,
-                 num_layers: int = 4, dropout: float = 0.1):
+    def __init__(self, in_dim: int, hidden_dim: int, num_layers: int, dropout: float):
         super().__init__()
-        self.node_proj = nn.Linear(node_feat_dim, hidden_dim)
-
+        self.proj = nn.Linear(in_dim, hidden_dim)
         self.convs = nn.ModuleList()
         self.bns = nn.ModuleList()
         for _ in range(num_layers):
@@ -40,64 +38,97 @@ class TourEncoder(nn.Module):
             )
             self.convs.append(GINConv(mlp))
             self.bns.append(nn.BatchNorm1d(hidden_dim))
-
         self.drop = nn.Dropout(dropout)
-        self.head = MLP(hidden_dim, hidden_dim, embedding_dim,
-                        num_layers=2, dropout=dropout)
 
-    def forward(self, x, edge_index, batch):
-        h = self.node_proj(x)
+    def forward(self, x, edge_index):
+        h = self.proj(x)
         for conv, bn in zip(self.convs, self.bns):
             h = conv(h, edge_index)
             h = bn(h)
             h = torch.relu(h)
             h = self.drop(h)
-        z = global_mean_pool(h, batch)      # (B, hidden_dim)
-        z = self.head(z)                    # (B, embedding_dim)
-        return z
+        return h
+
+
+class InstanceEncoder(nn.Module):
+    """Stream 1: encode the problem instance (KNN graph over coords).
+    Per-node embeddings carry instance-aware geometry, fed as init features into Stream 2.
+    """
+
+    def __init__(self, node_feat_dim: int, hidden_dim: int,
+                 num_layers: int, dropout: float):
+        super().__init__()
+        self.gnn = GINStack(node_feat_dim, hidden_dim, num_layers, dropout)
+
+    def forward(self, x, instance_edge_index):
+        return self.gnn(x, instance_edge_index)
+
+
+class TourEncoder(nn.Module):
+    """Stream 2: propagate instance-aware node features along the tour Hamiltonian
+    cycle, then mean-pool to a graph-level embedding z.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, embedding_dim: int,
+                 num_layers: int, dropout: float):
+        super().__init__()
+        self.gnn = GINStack(in_dim, hidden_dim, num_layers, dropout)
+        self.head = MLP(hidden_dim, hidden_dim, embedding_dim,
+                        num_layers=2, dropout=dropout)
+
+    def forward(self, h_node, tour_edge_index, batch):
+        h = self.gnn(h_node, tour_edge_index)
+        z = global_mean_pool(h, batch)
+        return self.head(z)
 
 
 class EdgeDecoder(nn.Module):
-    """From graph embedding z + raw coordinates, predict tour edges (inner-product)."""
+    """Predict tour edges from instance-aware node features and graph embedding z."""
 
-    def __init__(self, coord_dim: int, z_dim: int, hidden_dim: int,
+    def __init__(self, node_feat_dim: int, z_dim: int, hidden_dim: int,
                  dropout: float = 0.1):
         super().__init__()
-        self.node_mlp = MLP(coord_dim + z_dim, hidden_dim, hidden_dim,
+        self.node_mlp = MLP(node_feat_dim + z_dim, hidden_dim, hidden_dim,
                             num_layers=2, dropout=dropout)
 
-    def forward(self, z, coords, batch):
-        z_broad = z[batch]                           # (N_total, z_dim)
-        h = self.node_mlp(torch.cat([coords, z_broad], dim=-1))  # (N_total, H)
+    def forward(self, z, node_feat, batch):
+        z_broad = z[batch]
+        h = self.node_mlp(torch.cat([node_feat, z_broad], dim=-1))
 
         scores = []
         for b in range(z.shape[0]):
             mask = batch == b
-            hb = h[mask]                             # (n, H)
+            hb = h[mask]
             n = hb.shape[0]
             ri, ci = torch.triu_indices(n, n, offset=1, device=h.device)
-            s = (hb[ri] * hb[ci]).sum(dim=-1)        # (n*(n-1)/2,)
+            s = (hb[ri] * hb[ci]).sum(dim=-1)
             scores.append(s)
-        return torch.cat(scores)                     # (B * n*(n-1)/2,)
+        return torch.cat(scores)
 
 
 class TourAutoEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.encoder = TourEncoder(
-            cfg.node_feat_dim, cfg.hidden_dim, cfg.embedding_dim,
+        self.instance_encoder = InstanceEncoder(
+            cfg.node_feat_dim, cfg.hidden_dim,
+            cfg.num_instance_gnn_layers, cfg.dropout,
+        )
+        self.tour_encoder = TourEncoder(
+            cfg.hidden_dim, cfg.hidden_dim, cfg.embedding_dim,
             cfg.num_gnn_layers, cfg.dropout,
         )
         self.decoder = EdgeDecoder(
-            cfg.node_feat_dim, cfg.embedding_dim,
+            cfg.hidden_dim, cfg.embedding_dim,
             cfg.decoder_hidden_dim, cfg.dropout,
         )
 
     def forward(self, data):
-        z = self.encoder(data.x, data.edge_index, data.batch)
-        scores = self.decoder(z, data.x, data.batch)
+        h_inst = self.instance_encoder(data.x, data.instance_edge_index)
+        z = self.tour_encoder(h_inst, data.edge_index, data.batch)
+        scores = self.decoder(z, h_inst, data.batch)
         return z, scores
 
     @torch.no_grad()
     def encode(self, data):
-        return self.encoder(data.x, data.edge_index, data.batch)
+        h_inst = self.instance_encoder(data.x, data.instance_edge_index)
+        return self.tour_encoder(h_inst, data.edge_index, data.batch)

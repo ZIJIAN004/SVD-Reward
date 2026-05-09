@@ -56,7 +56,7 @@ def main():
     test_data, test_lengths, test_good, test_iids = generate_dataset(
         cfg.num_test_instances, cfg.num_nodes,
         cfg.num_good_solutions, cfg.num_random_solutions,
-        seed=cfg.seed + 2,
+        seed=cfg.seed + 2, knn_k=cfg.knn_k,
     )
     test_emb, test_iids_t = collect_embeddings_with_iid(
         model, test_data, cfg.batch_size, device

@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from torch_geometric.data import Data
+from torch_geometric.utils import to_undirected
 
 
 def generate_instance(n: int, rng: np.random.Generator = None) -> np.ndarray:
@@ -70,6 +71,19 @@ def tour_to_edge_index(tour: np.ndarray) -> torch.Tensor:
     return torch.tensor([src, dst], dtype=torch.long)
 
 
+def knn_edge_index(coords: np.ndarray, k: int) -> torch.Tensor:
+    """Undirected KNN graph over node coordinates (used by the instance stream)."""
+    n = len(coords)
+    k = min(k, n - 1)
+    dists = np.linalg.norm(coords[:, None] - coords[None, :], axis=-1)
+    np.fill_diagonal(dists, np.inf)
+    knn_idx = np.argsort(dists, axis=1)[:, :k]
+    src = np.repeat(np.arange(n), k)
+    dst = knn_idx.flatten()
+    edge_index = torch.tensor(np.stack([src, dst]), dtype=torch.long)
+    return to_undirected(edge_index)
+
+
 def compute_edge_labels(tour: np.ndarray, n: int) -> torch.Tensor:
     """Binary labels for all upper-triangle edges: 1 if in tour, 0 otherwise."""
     tour_edges = set()
@@ -83,11 +97,17 @@ def compute_edge_labels(tour: np.ndarray, n: int) -> torch.Tensor:
     return torch.tensor(labels, dtype=torch.float32)
 
 
-def make_pyg_data(coords: np.ndarray, tour: np.ndarray, instance_id: int = -1) -> Data:
+def make_pyg_data(
+    coords: np.ndarray,
+    tour: np.ndarray,
+    instance_id: int = -1,
+    knn_k: int = 10,
+) -> Data:
     n = len(tour)
     return Data(
         x=torch.tensor(coords, dtype=torch.float32),
         edge_index=tour_to_edge_index(tour),
+        instance_edge_index=knn_edge_index(coords, k=knn_k),
         target=compute_edge_labels(tour, n),
         tour_len=torch.tensor([tour_length(coords, tour)], dtype=torch.float32),
         instance_id=torch.tensor([instance_id], dtype=torch.long),
@@ -100,6 +120,7 @@ def generate_dataset(
     num_good: int = 50,
     num_random: int = 50,
     seed: int = 42,
+    knn_k: int = 10,
 ):
     """
     Returns:
@@ -121,7 +142,7 @@ def generate_dataset(
         for s in starts:
             tour = nearest_neighbor(coords, start=int(s))
             tour = two_opt(coords, tour)
-            d = make_pyg_data(coords, tour, instance_id=inst)
+            d = make_pyg_data(coords, tour, instance_id=inst, knn_k=knn_k)
             data_list.append(d)
             lengths.append(d.tour_len.item())
             is_good.append(True)
@@ -129,7 +150,7 @@ def generate_dataset(
 
         for _ in range(num_random):
             tour = random_tour(num_nodes, rng)
-            d = make_pyg_data(coords, tour, instance_id=inst)
+            d = make_pyg_data(coords, tour, instance_id=inst, knn_k=knn_k)
             data_list.append(d)
             lengths.append(d.tour_len.item())
             is_good.append(False)

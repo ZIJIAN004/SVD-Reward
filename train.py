@@ -62,13 +62,13 @@ def train(cfg: Config = None):
     train_data, _, train_good, train_iids = generate_dataset(
         cfg.num_train_instances, cfg.num_nodes,
         cfg.num_good_solutions, cfg.num_random_solutions,
-        seed=cfg.seed,
+        seed=cfg.seed, knn_k=cfg.knn_k,
     )
     print("Generating validation data …")
     val_data, _, _, _ = generate_dataset(
         cfg.num_val_instances, cfg.num_nodes,
         cfg.num_good_solutions, cfg.num_random_solutions,
-        seed=cfg.seed + 1,
+        seed=cfg.seed + 1, knn_k=cfg.knn_k,
     )
     print(f"Train: {len(train_data)}  Val: {len(val_data)}")
 
