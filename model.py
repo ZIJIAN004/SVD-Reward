@@ -83,7 +83,13 @@ class TourEncoder(nn.Module):
 
 
 class EdgeDecoder(nn.Module):
-    """Predict tour edges from instance-aware node features and graph embedding z."""
+    """Predict tour edges from instance-aware node features and graph embedding z.
+
+    Vectorized over the batch via bmm + precomputed upper-triangle indices.
+    Assumes all graphs in the batch have the same number of nodes (TSP standard:
+    fixed problem size). Lexicographic upper-triangle ordering matches
+    tsp_data.compute_edge_labels so BCE targets align.
+    """
 
     def __init__(self, node_feat_dim: int, z_dim: int, hidden_dim: int,
                  dropout: float = 0.1):
@@ -92,18 +98,26 @@ class EdgeDecoder(nn.Module):
                             num_layers=2, dropout=dropout)
 
     def forward(self, z, node_feat, batch):
-        z_broad = z[batch]
-        h = self.node_mlp(torch.cat([node_feat, z_broad], dim=-1))
+        # z: (B, D_z); node_feat: (B*N, D_in); batch: (B*N,) graph index per node
+        z_broad = z[batch]                                            # (B*N, D_z)
+        h = self.node_mlp(torch.cat([node_feat, z_broad], dim=-1))    # (B*N, hidden)
 
-        scores = []
-        for b in range(z.shape[0]):
-            mask = batch == b
-            hb = h[mask]
-            n = hb.shape[0]
-            ri, ci = torch.triu_indices(n, n, offset=1, device=h.device)
-            s = (hb[ri] * hb[ci]).sum(dim=-1)
-            scores.append(s)
-        return torch.cat(scores)
+        B = z.shape[0]
+        N_total = h.shape[0]
+        N = N_total // B
+        assert N * B == N_total, (
+            f"EdgeDecoder requires fixed-size graphs (got total nodes {N_total} "
+            f"for B={B}: not divisible). For variable N, fall back to the per-"
+            f"graph loop.")
+
+        h_b = h.view(B, N, -1)                                        # (B, N, hidden)
+        inner = torch.bmm(h_b, h_b.transpose(1, 2))                   # (B, N, N)
+
+        # Upper triangle (i<j), same order as compute_edge_labels:
+        # i=0,j=1..N-1, then i=1,j=2..N-1, ... — lexicographic.
+        ri, ci = torch.triu_indices(N, N, offset=1, device=h.device)
+        scores = inner[:, ri, ci]                                     # (B, N*(N-1)/2)
+        return scores.reshape(-1)                                     # (B*N*(N-1)/2,)
 
 
 class TourAutoEncoder(nn.Module):

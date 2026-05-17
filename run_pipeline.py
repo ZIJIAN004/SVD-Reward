@@ -33,6 +33,41 @@ def collect_embeddings_with_iid(model, data_list, batch_size, device):
     return torch.cat(zs, dim=0), torch.cat(iids, dim=0)
 
 
+def rank_auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    """ROC AUC via rank-sum formula (O(N log N), no sklearn)."""
+    labels = labels.astype(bool)
+    n_pos = int(labels.sum())
+    n_neg = labels.size - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float('nan')
+    order = np.argsort(scores, kind='mergesort')
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, scores.size + 1)
+    pos_rank_sum = ranks[labels].sum()
+    return float((pos_rank_sum - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
+def z_class_separation(z: np.ndarray, labels: np.ndarray) -> float:
+    """Mean inter-class distance / mean intra-class distance in z space.
+
+    >1 means good and bad embeddings are MORE separated across classes than
+    within — a necessary (but not sufficient) condition for SVD reward to
+    distinguish quality. ≈1 means quality-agnostic AE collapsed both classes
+    onto the same manifold.
+    """
+    labels = labels.astype(bool)
+    z_good = z[labels]
+    z_bad  = z[~labels]
+    if len(z_good) < 2 or len(z_bad) < 2:
+        return float('nan')
+    mu_g, mu_b = z_good.mean(axis=0), z_bad.mean(axis=0)
+    inter = float(np.linalg.norm(mu_g - mu_b))
+    intra_g = float(np.linalg.norm(z_good - mu_g, axis=1).mean())
+    intra_b = float(np.linalg.norm(z_bad  - mu_b, axis=1).mean())
+    intra = (intra_g + intra_b) / 2
+    return inter / max(intra, 1e-8)
+
+
 def main():
     cfg = Config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,16 +121,55 @@ def main():
     cond_corr = float(np.mean(per_instance_corr))
     marg_corr = float(np.corrcoef(rewards, test_lengths_np)[0, 1])
 
-    print(f"\n{'':─<55}")
+    # ── Additional quality diagnostics (key to the "is the AE quality-aware?"
+    # question — without these, low cond_corr can't be diagnosed) ───────────
+    # AUC: P(reward_good > reward_bad) over all (g, b) pairs.
+    auc_global = rank_auc(rewards, test_good_np)
+    # Per-instance AUC: the GRPO-relevant version (in-instance ranking).
+    per_inst_aucs = []
+    for inst in np.unique(test_iids_np):
+        m = test_iids_np == inst
+        a = rank_auc(rewards[m], test_good_np[m])
+        if not np.isnan(a):
+            per_inst_aucs.append(a)
+    auc_per_inst = float(np.mean(per_inst_aucs))
+
+    # z-space separation: is the encoder ITSELF separating good vs bad,
+    # independent of the SVD step?
+    z_sep_global = z_class_separation(test_emb_np, test_good_np)
+    per_inst_seps = []
+    for inst in np.unique(test_iids_np):
+        m = test_iids_np == inst
+        s = z_class_separation(test_emb_np[m], test_good_np[m])
+        if not np.isnan(s):
+            per_inst_seps.append(s)
+    z_sep_per_inst = float(np.mean(per_inst_seps))
+
+    print(f"\n{'':─<70}")
     print(f"  Good (NN+2opt)  reward = {g_rew.mean():.4f} ± {g_rew.std():.4f}  "
           f"length = {g_len.mean():.2f} ± {g_len.std():.2f}")
     print(f"  Bad  (random)   reward = {b_rew.mean():.4f} ± {b_rew.std():.4f}  "
           f"length = {b_len.mean():.2f} ± {b_len.std():.2f}")
     print(f"  Reward separation (good − bad mean): {g_rew.mean() - b_rew.mean():.4f}")
+    print()
+    print(f"  ── reward ↔ length ──")
     print(f"  Marginal     corr(reward, length) = {marg_corr:.4f}")
     print(f"  Per-instance corr(reward, length) = {cond_corr:.4f}  "
           f"(this is what GRPO sees)")
-    print(f"{'':─<55}")
+    print()
+    print(f"  ── good vs bad classification (is the AE quality-aware?) ──")
+    print(f"  AUC(reward; good vs bad) global    = {auc_global:.4f}  "
+          f"(0.5=random, 1.0=perfect)")
+    print(f"  AUC(reward; good vs bad) per-inst  = {auc_per_inst:.4f}")
+    print(f"  z-space separation     global      = {z_sep_global:.4f}  "
+          f"(>1 = good/bad separated in z)")
+    print(f"  z-space separation     per-inst    = {z_sep_per_inst:.4f}")
+    print(f"{'':─<70}")
+    print(f"  Read me: cond_corr & per-inst AUC need to be high for SVD")
+    print(f"  reward to add real signal beyond cost. If z-sep per-inst ≈ 1,")
+    print(f"  the AE is quality-agnostic (training assumption broken) — try")
+    print(f"  contrastive loss or training only on good tours.")
+    print(f"{'':─<70}")
 
     # ── Step 3: Visualize ─────────────────────────────────────────────
     print("\n" + "=" * 60)
