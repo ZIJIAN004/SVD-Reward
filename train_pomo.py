@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
 
@@ -70,6 +71,14 @@ class POMOTrainConfig:
     svd_rank:  int   = 16
     svd_top_k: int   = 50
     svd_knn_k: int   = 10
+
+    # Online AE training (SupCon contrastive on POMO reward ordering)
+    online_ae:       bool  = False
+    ae_lr:           float = 1e-5    # smaller than POMO's lr (1e-4) — gentle update
+    ae_loss_weight:  float = 0.1     # weight of contrastive term in the joint loss
+    ae_temperature:  float = 0.1     # InfoNCE softness
+    ae_k_pos:        int   = 20      # # positives per instance for contrastive
+    ae_k_neg:        int   = 20      # # negatives per instance for contrastive
 
     log_period_sec: float = 30.0
 
@@ -120,11 +129,14 @@ def _tour_graph_inputs(selected_list: torch.Tensor):
     return tour_ei, batch_tour
 
 
-@torch.no_grad()
 def encode_rollouts(ae: TourAutoEncoder, node_xy: torch.Tensor,
                      selected_list: torch.Tensor, knn_k: int) -> torch.Tensor:
     """Two-stage encode: InstanceEncoder runs once per instance; TourEncoder
     over B·P rollouts. Saves ~100× FLOPs and memory vs naive B·P-graph batch.
+
+    No @torch.no_grad() — caller decides. For frozen AE wrap in torch.no_grad();
+    for online AE training keep grad on so contrastive loss can backprop.
+
     Returns z: (B, P, D)."""
     B, P, N = selected_list.shape
 
@@ -186,28 +198,94 @@ def compute_hybrid_advantage(z: torch.Tensor, rewards: torch.Tensor,
 
 
 # ────────────────────────────────────────────────────────────────────────
+#  Online AE training: SupCon-style contrastive loss
+# ────────────────────────────────────────────────────────────────────────
+
+def contrastive_supcon_loss(z: torch.Tensor, rewards: torch.Tensor,
+                             k_pos: int, k_neg: int,
+                             temperature: float = 0.1) -> torch.Tensor:
+    """
+    Supervised-contrastive loss using POMO reward ordering as the supervision.
+
+    For each instance:
+      - positives = top-k_pos rollouts by reward (= shortest tours)
+      - negatives = top-k_neg rollouts by reverse reward (= longest tours)
+      - For each positive anchor, pull other positives close, push negatives away.
+    No external quality labels needed — the reward ordering within each instance
+    IS the supervision signal.
+
+    Args:
+        z:           (B, P, D)
+        rewards:     (B, P)         higher = better tour (e.g., -length)
+        k_pos:       positives per instance
+        k_neg:       negatives per instance
+        temperature: InfoNCE temperature (lower = sharper)
+
+    Returns: scalar loss (mean over all anchors).
+    """
+    B, P, D = z.shape
+
+    _, pos_idx = rewards.topk(k_pos, dim=1, largest=True)             # (B, k_pos)
+    _, neg_idx = rewards.topk(k_neg, dim=1, largest=False)             # (B, k_neg)
+
+    bp_pos = torch.arange(B, device=z.device).unsqueeze(1).expand(B, k_pos)
+    bp_neg = torch.arange(B, device=z.device).unsqueeze(1).expand(B, k_neg)
+    z_pos = F.normalize(z[bp_pos, pos_idx], dim=-1)                    # (B, k_pos, D)
+    z_neg = F.normalize(z[bp_neg, neg_idx], dim=-1)                    # (B, k_neg, D)
+
+    # Cosine similarities (B, k_pos, k_pos) and (B, k_pos, k_neg), scaled by 1/τ.
+    sim_pp = torch.bmm(z_pos, z_pos.transpose(1, 2)) / temperature
+    sim_pn = torch.bmm(z_pos, z_neg.transpose(1, 2)) / temperature
+
+    # Mask self-similarity in positives (an anchor isn't its own positive pair).
+    diag = torch.eye(k_pos, device=z.device, dtype=torch.bool)
+    sim_pp = sim_pp.masked_fill(diag, float('-inf'))
+
+    # InfoNCE: −log( Σ_pos exp(sim/τ)  /  ( Σ_pos exp + Σ_neg exp ) )
+    log_num = torch.logsumexp(sim_pp, dim=2)                            # (B, k_pos)
+    log_den = torch.logsumexp(torch.cat([sim_pp, sim_pn], dim=2), dim=2)
+    return -(log_num - log_den).mean()
+
+
+# ────────────────────────────────────────────────────────────────────────
 #  AE loader
 # ────────────────────────────────────────────────────────────────────────
 
-def load_ae(ckpt_path: str, device: torch.device) -> TourAutoEncoder:
+def load_ae(ckpt_path: str, device: torch.device,
+            freeze: bool = True):
+    """Load pretrained AE. freeze=True (default) puts it in eval + no-grad
+    for use as a fixed reward model; freeze=False keeps it trainable for
+    online contrastive fine-tuning.
+
+    Returns (ae, ae_cfg_dict) — ae_cfg_dict is the original AE Config dict
+    so the online-trained variant can be saved in the same format.
+    """
     ckpt = torch.load(ckpt_path, map_location=device)
-    cfg = AEConfig(**ckpt["config"])
+    cfg_dict = ckpt["config"]
+    cfg = AEConfig(**cfg_dict)
     ae = TourAutoEncoder(cfg).to(device)
     ae.load_state_dict(ckpt["model"])
-    ae.eval()
-    for p in ae.parameters():
-        p.requires_grad_(False)
-    return ae
+    if freeze:
+        ae.eval()
+        for p in ae.parameters():
+            p.requires_grad_(False)
+    else:
+        ae.train()                          # BN running stats track POMO distribution
+        # Parameters keep requires_grad=True (default).
+    return ae, cfg_dict
 
 
 # ────────────────────────────────────────────────────────────────────────
 #  Training loop
 # ────────────────────────────────────────────────────────────────────────
 
-def _train_epoch(model, ae, env, optimizer, cfg, device, log_period_sec):
+def _train_epoch(model, ae, env, optimizer, ae_optimizer, cfg, device, log_period_sec):
     model.train()
+    if cfg.online_ae and ae is not None:
+        ae.train()                          # BN running stats follow POMO distribution
+
     episode = 0
-    losses, dists, corr_log = [], [], []
+    losses, dists, corr_log, ae_loss_log = [], [], [], []
     t_period = time.time()
 
     while episode < cfg.train_episodes:
@@ -227,37 +305,71 @@ def _train_epoch(model, ae, env, optimizer, cfg, device, log_period_sec):
 
         reward_f = reward.float()                                       # (B, P)
 
+        ae_loss = None
         if cfg.svd_alpha > 0.0 and ae is not None:
-            z = encode_rollouts(ae, env.node_xy, env.selected_node_list,
-                                knn_k=cfg.svd_knn_k)
-            advantage, diag = compute_hybrid_advantage(
-                z=z, rewards=reward_f,
-                alpha=cfg.svd_alpha, rank=cfg.svd_rank, top_k=cfg.svd_top_k,
-                return_diag=True)
+            if cfg.online_ae:
+                # Encode WITH grad — gradient will flow into AE through the
+                # contrastive loss. Advantage uses z.detach() so REINFORCE
+                # only updates POMO, not AE.
+                z = encode_rollouts(ae, env.node_xy, env.selected_node_list,
+                                    knn_k=cfg.svd_knn_k)
+                with torch.no_grad():
+                    advantage, diag = compute_hybrid_advantage(
+                        z=z.detach(), rewards=reward_f,
+                        alpha=cfg.svd_alpha, rank=cfg.svd_rank, top_k=cfg.svd_top_k,
+                        return_diag=True)
+                ae_loss = contrastive_supcon_loss(
+                    z=z, rewards=reward_f,
+                    k_pos=cfg.ae_k_pos, k_neg=cfg.ae_k_neg,
+                    temperature=cfg.ae_temperature,
+                )
+            else:
+                with torch.no_grad():
+                    z = encode_rollouts(ae, env.node_xy, env.selected_node_list,
+                                        knn_k=cfg.svd_knn_k)
+                    advantage, diag = compute_hybrid_advantage(
+                        z=z, rewards=reward_f,
+                        alpha=cfg.svd_alpha, rank=cfg.svd_rank, top_k=cfg.svd_top_k,
+                        return_diag=True)
             corr_log.append(diag['cost_svd_corr'].item())
         else:
             advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
 
         log_prob = prob_list.log().sum(dim=2)                           # (B, P)
-        loss = -(advantage * log_prob).mean()
+        pomo_loss = -(advantage * log_prob).mean()
+
+        if ae_loss is not None:
+            total_loss = pomo_loss + cfg.ae_loss_weight * ae_loss
+            ae_loss_log.append(ae_loss.item())
+        else:
+            total_loss = pomo_loss
 
         optimizer.zero_grad()
-        loss.backward()
+        if ae_optimizer is not None:
+            ae_optimizer.zero_grad()
+        total_loss.backward()
         optimizer.step()
+        if ae_optimizer is not None:
+            ae_optimizer.step()
 
-        losses.append(loss.item())
+        losses.append(pomo_loss.item())
         dists.append((-reward_f.max(dim=1).values).mean().item())       # best-of-P per instance
 
         if time.time() - t_period > log_period_sec or episode >= cfg.train_episodes:
-            corr_str = (f"  cost_corr={np.mean(corr_log[-50:]):+.3f}"
-                        if corr_log else "")
+            extra = ""
+            if corr_log:
+                extra += f"  cost_corr={np.mean(corr_log[-50:]):+.3f}"
+            if ae_loss_log:
+                extra += f"  ae_loss={np.mean(ae_loss_log[-50:]):+.4f}"
             print(f"  ep:{episode:6d}/{cfg.train_episodes}  "
                   f"loss={np.mean(losses[-50:]):+.4f}  "
-                  f"dist={np.mean(dists[-50:]):.4f}{corr_str}",
+                  f"dist={np.mean(dists[-50:]):.4f}{extra}",
                   flush=True)
             t_period = time.time()
 
-    return np.mean(dists), (np.mean(corr_log) if corr_log else None)
+    return (np.mean(dists),
+            (np.mean(corr_log) if corr_log else None),
+            (np.mean(ae_loss_log) if ae_loss_log else None))
 
 
 @torch.no_grad()
@@ -292,9 +404,19 @@ def train_pomo(ae_ckpt_path: str,
     print(f"Device: {device}", flush=True)
 
     ae = None
+    ae_cfg_dict = None
+    ae_optimizer = None
     if ae_ckpt_path is not None and cfg.svd_alpha > 0.0:
-        ae = load_ae(ae_ckpt_path, device)
-        print(f"AE loaded from {ae_ckpt_path}  (α={cfg.svd_alpha})", flush=True)
+        ae, ae_cfg_dict = load_ae(ae_ckpt_path, device, freeze=not cfg.online_ae)
+        mode_str = "ONLINE (contrastive fine-tune)" if cfg.online_ae else "FROZEN"
+        print(f"AE loaded from {ae_ckpt_path}  (α={cfg.svd_alpha}, {mode_str})",
+              flush=True)
+        if cfg.online_ae:
+            ae_optimizer = optim.Adam(ae.parameters(), lr=cfg.ae_lr)
+            print(f"AE optimizer: Adam(lr={cfg.ae_lr}, "
+                  f"loss_weight={cfg.ae_loss_weight}, "
+                  f"k_pos={cfg.ae_k_pos}, k_neg={cfg.ae_k_neg}, "
+                  f"τ={cfg.ae_temperature})", flush=True)
     else:
         print(f"Baseline POMO (no SVD; α={cfg.svd_alpha})", flush=True)
 
@@ -319,13 +441,14 @@ def train_pomo(ae_ckpt_path: str,
     run_dir = save_dir / tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    train_curve, eval_curve, corr_curve = [], [], []
+    train_curve, eval_curve, corr_curve, ae_loss_curve = [], [], [], []
     t0 = time.time()
 
     for ep in range(1, cfg.total_epoch + 1):
         print(f"\n[ep {ep:3d}/{cfg.total_epoch}]  elapsed={time.time()-t0:6.0f}s", flush=True)
-        train_dist, train_corr = _train_epoch(
-            model, ae, env, optimizer, cfg, device, cfg.log_period_sec)
+        train_dist, train_corr, train_ae_loss = _train_epoch(
+            model, ae, env, optimizer, ae_optimizer,
+            cfg, device, cfg.log_period_sec)
         eval_dist = _eval_epoch(model, env, cfg, device)
         scheduler.step()
 
@@ -333,9 +456,15 @@ def train_pomo(ae_ckpt_path: str,
         eval_curve.append(eval_dist)
         if train_corr is not None:
             corr_curve.append(train_corr)
+        if train_ae_loss is not None:
+            ae_loss_curve.append(train_ae_loss)
 
-        print(f"  train_dist={train_dist:.4f}  eval_dist={eval_dist:.4f}"
-              + (f"  cost_corr={train_corr:+.3f}" if train_corr is not None else ""),
+        suffix = ""
+        if train_corr is not None:
+            suffix += f"  cost_corr={train_corr:+.3f}"
+        if train_ae_loss is not None:
+            suffix += f"  ae_loss={train_ae_loss:.4f}"
+        print(f"  train_dist={train_dist:.4f}  eval_dist={eval_dist:.4f}{suffix}",
               flush=True)
 
         torch.save({
@@ -345,12 +474,19 @@ def train_pomo(ae_ckpt_path: str,
             'eval':     eval_dist,
             'train':    train_dist,
         }, run_dir / "ckpt_last.pt")
+        if cfg.online_ae and ae is not None:
+            torch.save({
+                'model':  ae.state_dict(),
+                'config': ae_cfg_dict,
+                'epoch':  ep,
+            }, run_dir / "ae_ckpt_last.pt")
 
     # Save curves for plotting.
     np.savez(run_dir / "curves.npz",
              train=np.array(train_curve),
              eval=np.array(eval_curve),
-             corr=np.array(corr_curve) if corr_curve else np.zeros(0))
+             corr=np.array(corr_curve) if corr_curve else np.zeros(0),
+             ae_loss=np.array(ae_loss_curve) if ae_loss_curve else np.zeros(0))
     print(f"\nDone. Best eval dist = {min(eval_curve):.4f} (epoch "
           f"{int(np.argmin(eval_curve))+1})", flush=True)
     return train_curve, eval_curve, corr_curve
@@ -359,19 +495,33 @@ def train_pomo(ae_ckpt_path: str,
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--ae-ckpt', type=str, default=None,
+    p.add_argument('--ae-ckpt',  type=str,   default=None,
                    help='AE checkpoint; omit for baseline POMO (α effectively 0).')
-    p.add_argument('--alpha', type=float, default=0.5)
-    p.add_argument('--epochs', type=int, default=100)
-    p.add_argument('--episodes', type=int, default=10_000)
-    p.add_argument('--save-dir', type=str, default='checkpoints')
-    p.add_argument('--tag', type=str, default=None)
+    p.add_argument('--alpha',    type=float, default=0.5)
+    p.add_argument('--epochs',   type=int,   default=100)
+    p.add_argument('--episodes', type=int,   default=10_000)
+    p.add_argument('--save-dir', type=str,   default='checkpoints')
+    p.add_argument('--tag',      type=str,   default=None)
+    p.add_argument('--online-ae', action='store_true',
+                   help='Fine-tune the AE online with a SupCon contrastive loss '
+                        'using POMO reward ordering as supervision.')
+    p.add_argument('--ae-lr',         type=float, default=1e-5)
+    p.add_argument('--ae-loss-weight', type=float, default=0.1)
+    p.add_argument('--ae-temp',       type=float, default=0.1)
+    p.add_argument('--ae-k-pos',      type=int,   default=20)
+    p.add_argument('--ae-k-neg',      type=int,   default=20)
     args = p.parse_args()
 
     cfg = POMOTrainConfig(
         total_epoch=args.epochs,
         train_episodes=args.episodes,
         svd_alpha=args.alpha,
+        online_ae=args.online_ae,
+        ae_lr=args.ae_lr,
+        ae_loss_weight=args.ae_loss_weight,
+        ae_temperature=args.ae_temp,
+        ae_k_pos=args.ae_k_pos,
+        ae_k_neg=args.ae_k_neg,
     )
     train_pomo(ae_ckpt_path=args.ae_ckpt, cfg=cfg,
                save_dir=args.save_dir, run_tag=args.tag)
