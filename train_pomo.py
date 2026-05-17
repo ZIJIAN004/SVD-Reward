@@ -73,9 +73,15 @@ class POMOTrainConfig:
     svd_knn_k:       int   = 10
     svd_temperature: float = 1.0     # softmax sharpness over non-anchors (lower = sharper)
 
-    # Online AE training (SupCon contrastive on POMO reward ordering)
-    online_ae:       bool  = False
-    ae_lr:           float = 1e-5    # smaller than POMO's lr (1e-4) — gentle update
+    # Online AE training (SupCon contrastive on POMO reward ordering).
+    # AE is always created and trained online when svd_alpha > 0;
+    # during the first ae_warmup_epochs the AE trains on POMO rollouts but
+    # the SVD signal is NOT yet mixed into POMO advantage (AE is "trained
+    # but not used yet" — gives the encoder time to learn structure before
+    # its outputs feed back into POMO).
+    ae_warmup_epochs: int   = 10     # epochs of AE-only training; SVD reward
+                                     # kicks in at epoch ae_warmup_epochs+1.
+    ae_lr:           float = 1e-4    # AE optimizer lr
     ae_loss_weight:  float = 0.1     # weight of contrastive term in the joint loss
     ae_temperature:  float = 0.1     # InfoNCE softness
     ae_k_pos:        int   = 20      # # positives per instance for contrastive
@@ -296,27 +302,31 @@ def contrastive_supcon_loss(z: torch.Tensor, rewards: torch.Tensor,
 #  AE loader
 # ────────────────────────────────────────────────────────────────────────
 
-def load_ae(ckpt_path: str, device: torch.device,
-            freeze: bool = True):
-    """Load pretrained AE. freeze=True (default) puts it in eval + no-grad
-    for use as a fixed reward model; freeze=False keeps it trainable for
-    online contrastive fine-tuning.
+def load_ae(ckpt_path, device: torch.device):
+    """Build a TourAutoEncoder. If ckpt_path is None, fresh-initialize with
+    default AEConfig — the AE will be trained from scratch online during
+    POMO training. If ckpt_path is given, load weights from that checkpoint.
 
-    Returns (ae, ae_cfg_dict) — ae_cfg_dict is the original AE Config dict
-    so the online-trained variant can be saved in the same format.
+    AE is always returned in train() mode with requires_grad=True (online
+    training is the only supported mode now — offline frozen-AE was dropped
+    when in-band warmup was introduced).
+
+    Returns (ae, ae_cfg_dict).
     """
-    ckpt = torch.load(ckpt_path, map_location=device)
-    cfg_dict = ckpt["config"]
-    cfg = AEConfig(**cfg_dict)
-    ae = TourAutoEncoder(cfg).to(device)
-    ae.load_state_dict(ckpt["model"])
-    if freeze:
-        ae.eval()
-        for p in ae.parameters():
-            p.requires_grad_(False)
+    if ckpt_path is None:
+        ae_cfg = AEConfig()
+        ae = TourAutoEncoder(ae_cfg).to(device)
+        cfg_dict = ae_cfg.__dict__.copy()
+        print("AE fresh-initialized (no checkpoint); will train in-band.",
+              flush=True)
     else:
-        ae.train()                          # BN running stats track POMO distribution
-        # Parameters keep requires_grad=True (default).
+        ckpt = torch.load(ckpt_path, map_location=device)
+        cfg_dict = ckpt["config"]
+        ae = TourAutoEncoder(AEConfig(**cfg_dict)).to(device)
+        ae.load_state_dict(ckpt["model"])
+        print(f"AE loaded from {ckpt_path}; continues online training.",
+              flush=True)
+    ae.train()
     return ae, cfg_dict
 
 
@@ -324,9 +334,18 @@ def load_ae(ckpt_path: str, device: torch.device,
 #  Training loop
 # ────────────────────────────────────────────────────────────────────────
 
-def _train_epoch(model, ae, env, optimizer, ae_optimizer, cfg, device, log_period_sec):
+def _train_epoch(model, ae, env, optimizer, ae_optimizer, cfg, device,
+                  log_period_sec, apply_svd_to_advantage: bool):
+    """
+    apply_svd_to_advantage=False (during warmup):
+        AE still trains via contrastive loss on POMO rollouts, but POMO
+        advantage uses pure baseline (R - mean(R)) — SVD signal is not
+        injected into POMO gradient until the encoder is warmed up.
+    apply_svd_to_advantage=True (post-warmup):
+        Hybrid advantage = cost_adv + α · svd_signal (anchors masked).
+    """
     model.train()
-    if cfg.online_ae and ae is not None:
+    if ae is not None:
         ae.train()                          # BN running stats follow POMO distribution
 
     episode = 0
@@ -352,34 +371,29 @@ def _train_epoch(model, ae, env, optimizer, ae_optimizer, cfg, device, log_perio
 
         ae_loss = None
         if cfg.svd_alpha > 0.0 and ae is not None:
-            if cfg.online_ae:
-                # Encode WITH grad — gradient will flow into AE through the
-                # contrastive loss. Advantage uses z.detach() so REINFORCE
-                # only updates POMO, not AE.
-                z = encode_rollouts(ae, env.node_xy, env.selected_node_list,
-                                    knn_k=cfg.svd_knn_k)
+            # AE always sees the rollouts and learns via contrastive (whether
+            # we use its output for POMO advantage or not).
+            z = encode_rollouts(ae, env.node_xy, env.selected_node_list,
+                                knn_k=cfg.svd_knn_k)                    # grad ON for AE
+            ae_loss = contrastive_supcon_loss(
+                z=z, rewards=reward_f,
+                k_pos=cfg.ae_k_pos, k_neg=cfg.ae_k_neg,
+                temperature=cfg.ae_temperature,
+            )
+
+            if apply_svd_to_advantage:
                 with torch.no_grad():
                     advantage, diag = compute_hybrid_advantage(
                         z=z.detach(), rewards=reward_f,
                         alpha=cfg.svd_alpha, rank=cfg.svd_rank, top_k=cfg.svd_top_k,
                         temperature=cfg.svd_temperature,
                         return_diag=True)
-                ae_loss = contrastive_supcon_loss(
-                    z=z, rewards=reward_f,
-                    k_pos=cfg.ae_k_pos, k_neg=cfg.ae_k_neg,
-                    temperature=cfg.ae_temperature,
-                )
+                corr_log.append(diag['cost_svd_corr'].item())
             else:
-                with torch.no_grad():
-                    z = encode_rollouts(ae, env.node_xy, env.selected_node_list,
-                                        knn_k=cfg.svd_knn_k)
-                    advantage, diag = compute_hybrid_advantage(
-                        z=z, rewards=reward_f,
-                        alpha=cfg.svd_alpha, rank=cfg.svd_rank, top_k=cfg.svd_top_k,
-                        temperature=cfg.svd_temperature,
-                        return_diag=True)
-            corr_log.append(diag['cost_svd_corr'].item())
+                # Warmup epoch: SVD reward NOT yet applied to POMO; baseline.
+                advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
         else:
+            # svd_alpha == 0 or no AE → pure baseline POMO.
             advantage = reward_f - reward_f.mean(dim=1, keepdim=True)
 
         log_prob = prob_list.log().sum(dim=2)                           # (B, P)
@@ -400,14 +414,15 @@ def _train_epoch(model, ae, env, optimizer, ae_optimizer, cfg, device, log_perio
             ae_optimizer.step()
 
         losses.append(pomo_loss.item())
-        dists.append((-reward_f.max(dim=1).values).mean().item())       # best-of-P per instance
+        dists.append((-reward_f.max(dim=1).values).mean().item())
 
         if time.time() - t_period > log_period_sec or episode >= cfg.train_episodes:
             extra = ""
             if corr_log:
                 extra += f"  cost_corr={np.mean(corr_log[-50:]):+.3f}"
             if ae_loss_log:
-                extra += f"  ae_loss={np.mean(ae_loss_log[-50:]):+.4f}"
+                phase = "ACTIVE" if apply_svd_to_advantage else "warmup"
+                extra += f"  ae_loss={np.mean(ae_loss_log[-50:]):+.4f}[{phase}]"
             print(f"  ep:{episode:6d}/{cfg.train_episodes}  "
                   f"loss={np.mean(losses[-50:]):+.4f}  "
                   f"dist={np.mean(dists[-50:]):.4f}{extra}",
@@ -453,19 +468,19 @@ def train_pomo(ae_ckpt_path: str,
     ae = None
     ae_cfg_dict = None
     ae_optimizer = None
-    if ae_ckpt_path is not None and cfg.svd_alpha > 0.0:
-        ae, ae_cfg_dict = load_ae(ae_ckpt_path, device, freeze=not cfg.online_ae)
-        mode_str = "ONLINE (contrastive fine-tune)" if cfg.online_ae else "FROZEN"
-        print(f"AE loaded from {ae_ckpt_path}  (α={cfg.svd_alpha}, {mode_str})",
-              flush=True)
-        if cfg.online_ae:
-            ae_optimizer = optim.Adam(ae.parameters(), lr=cfg.ae_lr)
-            print(f"AE optimizer: Adam(lr={cfg.ae_lr}, "
-                  f"loss_weight={cfg.ae_loss_weight}, "
-                  f"k_pos={cfg.ae_k_pos}, k_neg={cfg.ae_k_neg}, "
-                  f"τ={cfg.ae_temperature})", flush=True)
+    if cfg.svd_alpha > 0.0:
+        # AE is always created and trained online when svd_alpha > 0.
+        # ae_ckpt_path=None → fresh init; otherwise load weights and continue.
+        ae, ae_cfg_dict = load_ae(ae_ckpt_path, device)
+        ae_optimizer = optim.Adam(ae.parameters(), lr=cfg.ae_lr)
+        print(f"AE optimizer: Adam(lr={cfg.ae_lr}, "
+              f"loss_weight={cfg.ae_loss_weight}, "
+              f"k_pos={cfg.ae_k_pos}, k_neg={cfg.ae_k_neg}, "
+              f"τ={cfg.ae_temperature})", flush=True)
+        print(f"SVD reward kicks in after epoch {cfg.ae_warmup_epochs} "
+              f"(α={cfg.svd_alpha}, T={cfg.svd_temperature})", flush=True)
     else:
-        print(f"Baseline POMO (no SVD; α={cfg.svd_alpha})", flush=True)
+        print(f"Baseline POMO (no AE, no SVD; α=0)", flush=True)
 
     model = POMOModel(
         embedding_dim=cfg.embedding_dim,
@@ -492,10 +507,15 @@ def train_pomo(ae_ckpt_path: str,
     t0 = time.time()
 
     for ep in range(1, cfg.total_epoch + 1):
-        print(f"\n[ep {ep:3d}/{cfg.total_epoch}]  elapsed={time.time()-t0:6.0f}s", flush=True)
+        apply_svd = (ae is not None) and (ep > cfg.ae_warmup_epochs)
+        phase_tag = ("AE-warmup" if (ae is not None and not apply_svd)
+                     else ("hybrid-active" if apply_svd else "baseline"))
+        print(f"\n[ep {ep:3d}/{cfg.total_epoch}]  elapsed={time.time()-t0:6.0f}s  "
+              f"phase={phase_tag}", flush=True)
         train_dist, train_corr, train_ae_loss = _train_epoch(
             model, ae, env, optimizer, ae_optimizer,
-            cfg, device, cfg.log_period_sec)
+            cfg, device, cfg.log_period_sec,
+            apply_svd_to_advantage=apply_svd)
         eval_dist = _eval_epoch(model, env, cfg, device)
         scheduler.step()
 
@@ -521,7 +541,7 @@ def train_pomo(ae_ckpt_path: str,
             'eval':     eval_dist,
             'train':    train_dist,
         }, run_dir / "ckpt_last.pt")
-        if cfg.online_ae and ae is not None:
+        if ae is not None:
             torch.save({
                 'model':  ae.state_dict(),
                 'config': ae_cfg_dict,
@@ -543,20 +563,25 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument('--ae-ckpt',  type=str,   default=None,
-                   help='AE checkpoint; omit for baseline POMO (α effectively 0).')
+                   help='OPTIONAL AE checkpoint to start from. Default None: '
+                        'AE is fresh-initialized and trained in-band with '
+                        'POMO via contrastive loss.')
     p.add_argument('--alpha',    type=float, default=0.3,
-                   help='SVD modulation strength on top of cost_adv.')
+                   help='SVD modulation strength on top of cost_adv. '
+                        'α=0 disables SVD entirely (pure baseline POMO).')
     p.add_argument('--svd-temp', type=float, default=1.0,
                    help='softmax temperature for non-anchor SVD weighting '
                         '(lower=sharper, higher=more uniform).')
+    p.add_argument('--ae-warmup-epochs', type=int, default=10,
+                   help='Epochs to train AE on POMO rollouts before its '
+                        'output enters POMO advantage. During warmup the '
+                        'AE trains via contrastive loss but POMO uses the '
+                        'pure cost baseline. SVD kicks in at epoch warmup+1.')
     p.add_argument('--epochs',   type=int,   default=100)
     p.add_argument('--episodes', type=int,   default=10_000)
     p.add_argument('--save-dir', type=str,   default='checkpoints')
     p.add_argument('--tag',      type=str,   default=None)
-    p.add_argument('--online-ae', action='store_true',
-                   help='Fine-tune the AE online with a SupCon contrastive loss '
-                        'using POMO reward ordering as supervision.')
-    p.add_argument('--ae-lr',         type=float, default=1e-5)
+    p.add_argument('--ae-lr',         type=float, default=1e-4)
     p.add_argument('--ae-loss-weight', type=float, default=0.1)
     p.add_argument('--ae-temp',       type=float, default=0.1)
     p.add_argument('--ae-k-pos',      type=int,   default=20)
@@ -568,7 +593,7 @@ if __name__ == "__main__":
         train_episodes=args.episodes,
         svd_alpha=args.alpha,
         svd_temperature=args.svd_temp,
-        online_ae=args.online_ae,
+        ae_warmup_epochs=args.ae_warmup_epochs,
         ae_lr=args.ae_lr,
         ae_loss_weight=args.ae_loss_weight,
         ae_temperature=args.ae_temp,
