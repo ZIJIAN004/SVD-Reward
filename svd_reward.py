@@ -79,31 +79,35 @@ def per_instance_reward_torch(
     return_diag: bool = False,
 ):
     """
-    Fully batched per-instance SVD reward.  All B instances in parallel.
+    Per-instance SVD reward = -residual of each rollout's z to the
+    rank-k subspace fit on anchors.
+
+    Note on anchor residuals: anchors are in-sample for the SVD fit, so
+    their residual is approximately 0. Callers that combine this with
+    cost reward should HANDLE ANCHORS SEPARATELY (e.g., zero out the
+    SVD contribution for anchors) — see compute_hybrid_advantage in
+    train_pomo.py for the recommended treatment.
 
     Returns:
-        rewards: (B, K)  higher is better
-        diag:    dict (only if return_diag=True), see compute_svd_diagnostics
-                 docstring for fields.
+        rewards: (B, K)  -residual, higher is better
+        diag:    dict (only if return_diag=True).
     """
     B, K, D = z.shape
     A = anchor_idx.shape[1]
+    device = z.device
 
-    # Gather anchors per instance: (B, A, D)
-    batch_idx = torch.arange(B, device=z.device).unsqueeze(1).expand(B, A)
+    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, A)
     z_anchor = z[batch_idx, anchor_idx]                          # (B, A, D)
 
     mu = z_anchor.mean(dim=1, keepdim=True)                      # (B, 1, D)
     centered_anchor = z_anchor - mu                              # (B, A, D)
-
-    # Batched SVD.  Vt: (B, min(A,D), D); S: (B, min(A,D))
     _, S, Vt = torch.linalg.svd(centered_anchor, full_matrices=False)
     k = min(rank, Vt.shape[1])
     basis = Vt[:, :k, :]                                         # (B, k, D)
 
     centered_z = z - mu                                          # (B, K, D)
-    coeff = torch.einsum("bkd,brd->bkr", centered_z, basis)      # (B, K, k)
-    proj = torch.einsum("bkr,brd->bkd", coeff, basis)            # (B, K, D)
+    coeff = torch.einsum("bkd,brd->bkr", centered_z, basis)
+    proj = torch.einsum("bkr,brd->bkd", coeff, basis)
     residual = (centered_z - proj).norm(dim=-1)                  # (B, K)
     reward = -residual
 
@@ -111,36 +115,19 @@ def per_instance_reward_torch(
         return reward
 
     # ── Diagnostics ────────────────────────────────────────────────────────
-    sv_sq = S.square()                                            # (B, min(A,D))
-    total_var = sv_sq.sum(dim=1).clamp(min=1e-12)                 # (B,)
-
-    # Variance explained by the chosen rank — high means rank captures
-    # most of the anchor-subspace structure.
+    sv_sq = S.square()
+    total_var = sv_sq.sum(dim=1).clamp(min=1e-12)
     explained_var_ratio = (sv_sq[:, :k].sum(dim=1) / total_var).mean()
-
-    # 95% rank: smallest k* with cumulative variance ≥ 95% — suggests the
-    # "correct" rank choice; if rank_95 >> rank, you're truncating signal.
     cum_var = sv_sq.cumsum(dim=1) / total_var.unsqueeze(1)
-    rank_95 = (cum_var < 0.95).sum(dim=1).float() + 1.0           # (B,)
-
-    # Effective rank via singular-value entropy (Roy & Vetterli 2007):
-    # exp(H(s_normalized)). Low ≈ subspace is degenerate / collapsed;
-    # high ≈ anchors span many directions equally.
+    rank_95 = (cum_var < 0.95).sum(dim=1).float() + 1.0
     s_norm = S / S.sum(dim=1, keepdim=True).clamp(min=1e-12)
     entropy = -(s_norm * s_norm.clamp(min=1e-12).log()).sum(dim=1)
-    eff_rank = entropy.exp()                                      # (B,)
+    eff_rank = entropy.exp()
 
-    # Residual sanity check: anchors define the subspace so should have
-    # residual ≈ 0; non-anchors carry the actual reward signal.
-    anchor_mask = torch.zeros(B, K, dtype=torch.bool, device=z.device)
+    anchor_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
     anchor_mask.scatter_(1, anchor_idx, True)
     anchor_res     = residual[anchor_mask].mean()
     non_anchor_res = residual[~anchor_mask].mean()
-
-    # anchor_to_signal: how close anchor residuals are to non-anchor residuals.
-    # Ideal: << 1 (anchors define subspace, non-anchors deviate). If ≈ 1,
-    # anchors and non-anchors are indistinguishable in the subspace — the
-    # SVD has no discriminative power.
     anchor_to_signal = anchor_res / non_anchor_res.clamp(min=1e-8)
 
     diag = {

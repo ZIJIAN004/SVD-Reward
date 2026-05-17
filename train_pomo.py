@@ -67,10 +67,11 @@ class POMOTrainConfig:
     lr_gamma:     float = 0.1
 
     # SVD hybrid
-    svd_alpha: float = 0.5     # 0 = baseline POMO; 1 = pure SVD; 0.5 = balanced
-    svd_rank:  int   = 16
-    svd_top_k: int   = 50
-    svd_knn_k: int   = 10
+    svd_alpha:       float = 0.3     # modulation strength on top of cost_adv
+    svd_rank:        int   = 16
+    svd_top_k:       int   = 50
+    svd_knn_k:       int   = 10
+    svd_temperature: float = 1.0     # softmax sharpness over non-anchors (lower = sharper)
 
     # Online AE training (SupCon contrastive on POMO reward ordering)
     online_ae:       bool  = False
@@ -166,33 +167,77 @@ def _znorm(r: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def compute_hybrid_advantage(z: torch.Tensor, rewards: torch.Tensor,
                               alpha: float, rank: int, top_k: int,
+                              temperature: float = 1.0,
                               return_diag: bool = False):
-    """α·znorm(−svd_residual) + (1−α)·znorm(R). Returns (advantage[, diag])."""
+    """
+    Hybrid advantage = cost_adv + α · svd_signal.
+
+    Design: anchors (top-k by reward) get svd_signal = 0 — their in-sample
+    residual is ≈ 0 and just noises the gradient. Non-anchors do softmax
+    over themselves (with temperature T), scaled so per-non-anchor mean
+    weight is 1, then centered to mean 0 so the signal is purely a
+    redistribution among non-anchors.
+
+      anchor:     advantage = cost_adv (unchanged, pure POMO baseline)
+      non-anchor: advantage = cost_adv + α · (softmax redistribution)
+                  "close to anchor cluster" → positive correction
+                                              → less punishment
+                  "far from anchor cluster"  → negative correction
+                                              → more punishment
+
+    Returns:
+        advantage: (B, P)
+        diag:      dict (only if return_diag=True)
+    """
     B, P = rewards.shape
-    cost_adv = _znorm(rewards)
-    anchor_idx = topk_anchor_idx(-rewards, top_k=min(top_k, P // 2))
+    device = z.device
+    cost_adv = _znorm(rewards)                                            # (B, P)
+
+    top_k_eff = min(top_k, P // 2)
+    anchor_idx = topk_anchor_idx(-rewards, top_k=top_k_eff)               # (B, A)
+
+    anchor_mask = torch.zeros(B, P, dtype=torch.bool, device=device)
+    anchor_mask.scatter_(1, anchor_idx, True)
+    non_anchor_mask = ~anchor_mask                                        # (B, P)
+    naf = non_anchor_mask.float()
 
     if return_diag:
         raw_svd, svd_diag = per_instance_reward_torch(
             z, anchor_idx, rank=rank, return_diag=True)
     else:
         raw_svd = per_instance_reward_torch(z, anchor_idx, rank=rank)
-    svd_adv = _znorm(raw_svd)
-    advantage = alpha * svd_adv + (1.0 - alpha) * cost_adv
+
+    # Softmax over non-anchors only. raw_svd = -residual; higher = closer
+    # to subspace. Anchors are masked to -inf so their softmax weight is 0.
+    logits = (raw_svd / temperature).masked_fill(anchor_mask, float('-inf'))
+    sm = torch.softmax(logits, dim=1)                                     # (B, P), sums to 1 over non-anchors
+
+    n_non_anchors = naf.sum(dim=1, keepdim=True).clamp(min=1.0)
+    # (sm · n - 1) for non-anchors → mean 0 over non-anchors, range roughly
+    # [-1, n-1]. Anchors are 0 (since sm=0 there and we mask).
+    svd_signal = (sm * n_non_anchors - 1.0) * naf
+
+    advantage = cost_adv + alpha * svd_signal
 
     if not return_diag:
         return advantage
 
-    cs_c = cost_adv - cost_adv.mean(dim=1, keepdim=True)
-    sv_c = svd_adv  - svd_adv.mean(dim=1, keepdim=True)
+    # Pearson(cost_adv, svd_signal) over non-anchors only — anchors
+    # contribute 0 to svd_signal so including them dilutes the metric.
+    cs_mean = (cost_adv * naf).sum(dim=1, keepdim=True) / n_non_anchors
+    sv_mean = (svd_signal * naf).sum(dim=1, keepdim=True) / n_non_anchors
+    cs_c = (cost_adv - cs_mean) * naf
+    sv_c = (svd_signal - sv_mean) * naf
     num = (cs_c * sv_c).sum(dim=1)
     den = (cs_c.norm(dim=1) * sv_c.norm(dim=1)).clamp(min=1e-8)
     cost_svd_corr = (num / den).mean()
+
     diag = {
         **svd_diag,
-        'cost_svd_corr':     cost_svd_corr.detach(),
-        'cost_adv_abs_mean': cost_adv.abs().mean().detach(),
-        'svd_adv_abs_mean':  svd_adv.abs().mean().detach(),
+        'cost_svd_corr':       cost_svd_corr.detach(),
+        'cost_adv_abs_mean':   cost_adv.abs().mean().detach(),
+        'svd_signal_abs_mean': svd_signal.abs().mean().detach(),
+        'svd_signal_max':      svd_signal.max().detach(),
     }
     return advantage, diag
 
@@ -317,6 +362,7 @@ def _train_epoch(model, ae, env, optimizer, ae_optimizer, cfg, device, log_perio
                     advantage, diag = compute_hybrid_advantage(
                         z=z.detach(), rewards=reward_f,
                         alpha=cfg.svd_alpha, rank=cfg.svd_rank, top_k=cfg.svd_top_k,
+                        temperature=cfg.svd_temperature,
                         return_diag=True)
                 ae_loss = contrastive_supcon_loss(
                     z=z, rewards=reward_f,
@@ -330,6 +376,7 @@ def _train_epoch(model, ae, env, optimizer, ae_optimizer, cfg, device, log_perio
                     advantage, diag = compute_hybrid_advantage(
                         z=z, rewards=reward_f,
                         alpha=cfg.svd_alpha, rank=cfg.svd_rank, top_k=cfg.svd_top_k,
+                        temperature=cfg.svd_temperature,
                         return_diag=True)
             corr_log.append(diag['cost_svd_corr'].item())
         else:
@@ -497,7 +544,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--ae-ckpt',  type=str,   default=None,
                    help='AE checkpoint; omit for baseline POMO (α effectively 0).')
-    p.add_argument('--alpha',    type=float, default=0.5)
+    p.add_argument('--alpha',    type=float, default=0.3,
+                   help='SVD modulation strength on top of cost_adv.')
+    p.add_argument('--svd-temp', type=float, default=1.0,
+                   help='softmax temperature for non-anchor SVD weighting '
+                        '(lower=sharper, higher=more uniform).')
     p.add_argument('--epochs',   type=int,   default=100)
     p.add_argument('--episodes', type=int,   default=10_000)
     p.add_argument('--save-dir', type=str,   default='checkpoints')
@@ -516,6 +567,7 @@ if __name__ == "__main__":
         total_epoch=args.epochs,
         train_episodes=args.episodes,
         svd_alpha=args.alpha,
+        svd_temperature=args.svd_temp,
         online_ae=args.online_ae,
         ae_lr=args.ae_lr,
         ae_loss_weight=args.ae_loss_weight,
