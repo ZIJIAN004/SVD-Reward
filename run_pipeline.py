@@ -4,6 +4,9 @@ End-to-end pipeline (per-instance SVD version):
   2. Encode test instances; for each, fit a local SVD on its good-solution
      embeddings and score every tour by -‖orthogonal residual‖
   3. Visualize reward vs tour length, separation, and a sample SVD spectrum
+  4. Train POMO TSP policy with SVD-hybrid advantage (the actual experiment;
+     side-by-side baseline POMO run for comparison).
+  5. Plot eval curves comparing hybrid vs baseline.
 """
 
 import sys
@@ -212,11 +215,69 @@ def main():
     print(f"Figure saved → {fig_path}")
     plt.close()
 
-    # ── Summary ───────────────────────────────────────────────────────
+    # ── Step 4: Actual experiment — POMO with SVD-hybrid vs baseline ──
+    print("\n" + "=" * 60)
+    print("Step 4 / 5 : POMO training (hybrid SVD+cost  vs  baseline cost-only)")
+    print("=" * 60)
+    from train_pomo import train_pomo, POMOTrainConfig
+
+    ae_ckpt_full = save_dir / "best_model.pt"
+    pomo_cfg = POMOTrainConfig(num_nodes=cfg.num_nodes)
+    # Light defaults for the sanity-check run inside the pipeline; for the
+    # full experiment call train_pomo() directly with longer schedule.
+    pomo_cfg.total_epoch    = 30
+    pomo_cfg.train_episodes = 5_000
+    pomo_cfg.eval_episodes  = 1_000
+
+    print("\n>>> baseline POMO (α=0, cost reward only)")
+    pomo_cfg_base = POMOTrainConfig(**{**pomo_cfg.__dict__, 'svd_alpha': 0.0})
+    train_b, eval_b, _ = train_pomo(
+        ae_ckpt_path=None, cfg=pomo_cfg_base,
+        save_dir=str(save_dir / "pomo_runs"), run_tag="baseline_a0.0",
+    )
+
+    print("\n>>> hybrid POMO (α=0.5, SVD + cost)")
+    pomo_cfg_hyb = POMOTrainConfig(**{**pomo_cfg.__dict__, 'svd_alpha': 0.5})
+    train_h, eval_h, corr_h = train_pomo(
+        ae_ckpt_path=str(ae_ckpt_full), cfg=pomo_cfg_hyb,
+        save_dir=str(save_dir / "pomo_runs"), run_tag="hybrid_a0.5",
+    )
+
+    # ── Step 5: Plot eval curves ──────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 5 / 5 : Comparison plot")
+    print("=" * 60)
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    epochs = np.arange(1, len(eval_b) + 1)
+    ax[0].plot(epochs, eval_b, marker='o', markersize=3, label='baseline (α=0)',
+               color="#888888")
+    ax[0].plot(epochs, eval_h, marker='o', markersize=3, label='hybrid (α=0.5)',
+               color="#3498db")
+    ax[0].set_xlabel("Epoch"); ax[0].set_ylabel("Avg tour distance")
+    ax[0].set_title("POMO eval distance")
+    ax[0].grid(True); ax[0].legend()
+
+    if len(corr_h) > 0:
+        ax[1].plot(np.arange(1, len(corr_h) + 1), corr_h,
+                   marker='o', markersize=3, color="#e74c3c")
+        ax[1].axhline(0, linestyle='--', color='gray', alpha=0.5)
+        ax[1].set_xlabel("Epoch"); ax[1].set_ylabel("cost_svd_corr (per-instance Pearson)")
+        ax[1].set_title("SVD ↔ cost signal correlation\n(≈±1 redundant; ≈0 orthogonal)")
+        ax[1].set_ylim(-1.05, 1.05); ax[1].grid(True)
+
+    plt.tight_layout()
+    pomo_fig = save_dir / "pomo_comparison.png"
+    plt.savefig(pomo_fig, dpi=150)
+    plt.close()
+    print(f"Comparison plot saved → {pomo_fig}")
+
     print("\n" + "=" * 60)
     print("Pipeline complete.")
-    print(f"  Model checkpoint : {save_dir / 'best_model.pt'}")
-    print(f"  Evaluation plot  : {fig_path}")
+    print(f"  AE checkpoint           : {ae_ckpt_full}")
+    print(f"  AE evaluation plot      : {fig_path}")
+    print(f"  Baseline POMO best eval : {min(eval_b):.4f}")
+    print(f"  Hybrid POMO best eval   : {min(eval_h):.4f}")
+    print(f"  Comparison plot         : {pomo_fig}")
     print("=" * 60)
 
 
