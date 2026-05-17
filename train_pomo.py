@@ -46,9 +46,9 @@ class POMOTrainConfig:
     pomo_size:        int = 100
 
     # Schedule
-    total_epoch:      int = 100
-    train_episodes:   int = 10_000        # episodes per epoch (instances)
-    eval_episodes:    int =  1_000
+    total_epoch:      int = 200
+    train_episodes:   int = 100_000       # episodes per epoch (instances)
+    eval_episodes:    int =  10_000
     train_batch_size: int =   64
     eval_batch_size:  int =  256
 
@@ -63,7 +63,7 @@ class POMOTrainConfig:
     # Optimization
     lr:           float = 1e-4
     weight_decay: float = 1e-6
-    lr_milestones: tuple = (90, 95)
+    lr_milestones: tuple = (181, 191)     # decay near end of 200-epoch schedule
     lr_gamma:     float = 0.1
 
     # SVD hybrid
@@ -577,8 +577,8 @@ if __name__ == "__main__":
                         'output enters POMO advantage. During warmup the '
                         'AE trains via contrastive loss but POMO uses the '
                         'pure cost baseline. SVD kicks in at epoch warmup+1.')
-    p.add_argument('--epochs',   type=int,   default=100)
-    p.add_argument('--episodes', type=int,   default=10_000)
+    p.add_argument('--epochs',   type=int,   default=200)
+    p.add_argument('--episodes', type=int,   default=100_000)
     p.add_argument('--save-dir', type=str,   default='checkpoints')
     p.add_argument('--tag',      type=str,   default=None)
     p.add_argument('--ae-lr',         type=float, default=1e-4)
