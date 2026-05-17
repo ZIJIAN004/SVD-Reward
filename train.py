@@ -1,3 +1,6 @@
+import sys
+sys.stdout.reconfigure(line_buffering=True)   # unbuffered when piped/redirected
+
 import torch
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
@@ -56,21 +59,21 @@ def train(cfg: Config = None):
         cfg = Config()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
-    print("Generating training data …")
+    print("Generating training data …", flush=True)
     train_data, _, train_good, train_iids = generate_dataset(
         cfg.num_train_instances, cfg.num_nodes,
         cfg.num_good_solutions, cfg.num_random_solutions,
         seed=cfg.seed, knn_k=cfg.knn_k,
     )
-    print("Generating validation data …")
+    print("Generating validation data …", flush=True)
     val_data, _, _, _ = generate_dataset(
         cfg.num_val_instances, cfg.num_nodes,
         cfg.num_good_solutions, cfg.num_random_solutions,
         seed=cfg.seed + 1, knn_k=cfg.knn_k,
     )
-    print(f"Train: {len(train_data)}  Val: {len(val_data)}")
+    print(f"Train: {len(train_data)}  Val: {len(val_data)}", flush=True)
 
     train_loader = DataLoader(train_data, batch_size=cfg.batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=cfg.batch_size)
@@ -80,7 +83,7 @@ def train(cfg: Config = None):
                              weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, patience=5, factor=0.5)
     pw = pos_weight_for(cfg.num_nodes)
-    print(f"pos_weight = {pw:.1f}")
+    print(f"pos_weight = {pw:.1f}", flush=True)
 
     save_dir = Path(cfg.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +95,8 @@ def train(cfg: Config = None):
         sched.step(v_loss)
         lr_now = optim.param_groups[0]["lr"]
         print(f"Ep {ep:3d}  train_loss={t_loss:.4f}  "
-              f"val_loss={v_loss:.4f}  val_acc={v_acc:.4f}  lr={lr_now:.1e}")
+              f"val_loss={v_loss:.4f}  val_acc={v_acc:.4f}  lr={lr_now:.1e}",
+              flush=True)
 
         if v_loss < best_val:
             best_val = v_loss
@@ -105,10 +109,10 @@ def train(cfg: Config = None):
         else:
             patience_cnt += 1
             if patience_cnt >= cfg.patience:
-                print(f"Early stopping at epoch {ep}")
+                print(f"Early stopping at epoch {ep}", flush=True)
                 break
 
-    print(f"Best val_loss = {best_val:.4f}")
+    print(f"Best val_loss = {best_val:.4f}", flush=True)
     return model, train_data, train_good, train_iids
 
 

@@ -6,6 +6,11 @@ End-to-end pipeline (per-instance SVD version):
   3. Visualize reward vs tour length, separation, and a sample SVD spectrum
 """
 
+import sys
+# Force line-buffered stdout so progress prints don't get stuck in pipe/file
+# buffers when run under nohup/SLURM/redirection.
+sys.stdout.reconfigure(line_buffering=True)
+
 import torch
 import numpy as np
 import matplotlib

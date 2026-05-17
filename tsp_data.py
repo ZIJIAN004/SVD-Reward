@@ -121,6 +121,7 @@ def generate_dataset(
     num_random: int = 50,
     seed: int = 42,
     knn_k: int = 10,
+    progress_every: int = 10,
 ):
     """
     Returns:
@@ -128,9 +129,14 @@ def generate_dataset(
         lengths:      list[float]
         is_good:      list[bool]   True for NN+2opt solutions, False for random
         instance_ids: list[int]    which instance each tour belongs to
+
+    Prints a progress line every `progress_every` instances so the script
+    doesn't look dead during the slow 2opt phase (set to 0 to silence).
     """
+    import time as _time
     rng = np.random.default_rng(seed)
     data_list, lengths, is_good, instance_ids = [], [], [], []
+    t0 = _time.time()
 
     for inst in range(num_instances):
         coords = generate_instance(num_nodes, rng)
@@ -155,5 +161,13 @@ def generate_dataset(
             lengths.append(d.tour_len.item())
             is_good.append(False)
             instance_ids.append(inst)
+
+        if progress_every and ((inst + 1) % progress_every == 0 or inst + 1 == num_instances):
+            elapsed = _time.time() - t0
+            rate = (inst + 1) / max(elapsed, 1e-6)
+            eta = (num_instances - inst - 1) / max(rate, 1e-6)
+            print(f"  [data] {inst+1:4d}/{num_instances} instances  "
+                  f"elapsed={elapsed:6.1f}s  ETA={eta:6.1f}s",
+                  flush=True)
 
     return data_list, lengths, is_good, instance_ids
